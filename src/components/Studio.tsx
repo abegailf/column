@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { MediaItem, MediaEdits, Recipe } from '../types';
 import { presets, defaultEdits } from '../data';
 import { getFilterStyle } from '../lib/filters';
@@ -332,6 +332,13 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
 
   const filterStyle = getFilterStyle(currentEdits);
 
+  // Resolve the LUT URL from the active preset's data definition so we never
+  // need to hard-code preset IDs here — any preset can opt into a LUT by
+  // setting `lutUrl` in data.ts.
+  const activeLutUrl = currentEdits.preset
+    ? (presets.find(p => p.id === currentEdits.preset)?.lutUrl ?? null)
+    : null;
+
   return (
     <div className="fixed inset-0 z-50 bg-black flex flex-col text-white">
       {/* Header */}
@@ -371,9 +378,9 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
           {item.type === 'image' ? (
             <LutFilterCanvas
               src={item.url}
-              lutUrl={currentEdits.preset === 'moody_film' ? '/moody_film.png' : null}
+              lutUrl={activeLutUrl}
               className="max-w-full max-h-full object-contain"
-              style={filterStyle} 
+              style={filterStyle}
             />
           ) : (
             <video
@@ -408,14 +415,25 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                   )}
                 >
                   <div className="w-16 h-16 rounded-md overflow-hidden bg-neutral-900 border border-white/20 relative">
-                    {/* Static thumbnail for preset preview to avoid video performance issues */}
-                    <img
-                      src={item.type === 'image' ? item.url : 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?q=80&w=200&auto=format&fit=crop'}
-                      alt={preset.name}
-                      className="w-full h-full object-cover"
-                      style={getFilterStyle({ ...defaultEdits, preset: preset.id === 'none' ? null : preset.id })}
-                      referrerPolicy="no-referrer"
-                    />
+                    {preset.lutUrl ? (
+                      // LUT-based preset: render via WebGL canvas so the
+                      // thumbnail actually shows the colour grade.
+                      <LutFilterCanvas
+                        src={item.type === 'image' ? item.url : 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?q=80&w=200&auto=format&fit=crop'}
+                        lutUrl={preset.lutUrl}
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      // CSS-filter preset: a plain <img> with the filter applied
+                      // is sufficient and avoids creating unnecessary WebGL contexts.
+                      <img
+                        src={item.type === 'image' ? item.url : 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?q=80&w=200&auto=format&fit=crop'}
+                        alt={preset.name}
+                        className="w-full h-full object-cover"
+                        style={getFilterStyle({ ...defaultEdits, preset: preset.id === 'none' ? null : preset.id })}
+                        referrerPolicy="no-referrer"
+                      />
+                    )}
                   </div>
                   <span className="text-xs font-medium tracking-wider uppercase">{preset.name}</span>
                 </button>
