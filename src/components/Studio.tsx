@@ -1,10 +1,11 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { MediaItem, MediaEdits, Recipe } from '../types';
 import { presets, defaultEdits } from '../data';
 import { getFilterStyle } from '../lib/filters';
 import { X, Undo2, Redo2, SlidersHorizontal, Image as ImageIcon, Download, Loader2, Sparkles, Plus } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { LutFilterCanvas } from './LutFilterCanvas';
 
 interface StudioProps {
   item: MediaItem;
@@ -26,9 +27,16 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
   const [newRecipeName, setNewRecipeName] = useState('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const isMounted = useRef(false);
 
-  // Sync currentEdits to parent immediately
+  // Sync currentEdits to parent, but skip the initial mount so we don't
+  // fire onUpdate with the unchanged initial edits (which would cause App
+  // to call setEditingItem unnecessarily and trigger extra re-renders).
   useEffect(() => {
+    if (!isMounted.current) {
+      isMounted.current = true;
+      return;
+    }
     onUpdate({ ...item, edits: currentEdits });
   }, [currentEdits]);
 
@@ -361,12 +369,11 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
       <div className="flex-1 flex items-center justify-center overflow-hidden pt-16 pb-48">
         <div className="w-full h-full max-w-2xl mx-auto flex items-center justify-center p-4">
           {item.type === 'image' ? (
-            <img
+            <LutFilterCanvas
               src={item.url}
-              alt="Preview"
+              lutUrl={currentEdits.preset === 'moody_film' ? '/moody_film.png' : null}
               className="max-w-full max-h-full object-contain"
-              style={filterStyle}
-              referrerPolicy="no-referrer"
+              style={filterStyle} 
             />
           ) : (
             <video

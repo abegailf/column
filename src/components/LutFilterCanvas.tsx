@@ -1,5 +1,4 @@
 import React, { useEffect, useRef } from 'react';
-import { ParsedLUT } from '../lib/lutParser';
 
 const vertexShaderSource = `#version 300 es
 in vec2 a_position;
@@ -18,7 +17,7 @@ precision highp float;
 in vec2 v_texCoord;
 
 uniform sampler2D u_image;
-uniform highp sampler3D u_lut;
+uniform sampler2D u_lut; // Switched to 2D
 uniform bool u_hasLut;
 
 out vec4 outColor;
@@ -27,11 +26,40 @@ void main() {
   vec4 color = texture(u_image, v_texCoord);
   
   if (u_hasLut) {
-    // Sample the 3D LUT using the original pixel's RGB values as 3D coordinates.
-    // We clamp to [0.0, 1.0] to ensure we don't sample outside the LUT boundaries.
-    // The texture() function with sampler3D automatically handles trilinear interpolation.
-    vec3 lutColor = texture(u_lut, clamp(color.rgb, 0.0, 1.0)).rgb;
-    outColor = vec4(lutColor, color.a);
+    // Math configuration for our 64-size LUT converted to an 8x8 grid on a 512x512 texture
+    float size = 64.0;
+    float cols = 8.0;
+    
+    vec3 c = clamp(color.rgb, 0.0, 1.0);
+    float blueColor = c.b * (size - 1.0);
+    
+    // Find the two Z-depth quads to interpolate between
+    vec2 quad1;
+    quad1.y = floor(floor(blueColor) / cols);
+    quad1.x = floor(blueColor) - (quad1.y * cols);
+    
+    vec2 quad2;
+    quad2.y = floor(ceil(blueColor) / cols);
+    quad2.x = ceil(blueColor) - (quad2.y * cols);
+    
+    float texWidth = size * cols;
+    float texHeight = size * cols;
+    
+    // Map Red/Green to X/Y inside the specific Z-depth quad
+    vec2 texPos1;
+    texPos1.x = (quad1.x * size + 0.5 + c.r * (size - 1.0)) / texWidth;
+    texPos1.y = (quad1.y * size + 0.5 + c.g * (size - 1.0)) / texHeight;
+    
+    vec2 texPos2;
+    texPos2.x = (quad2.x * size + 0.5 + c.r * (size - 1.0)) / texWidth;
+    texPos2.y = (quad2.y * size + 0.5 + c.g * (size - 1.0)) / texHeight;
+    
+    // Sample both 2D points and mix (Simulated Trilinear Interpolation)
+    vec3 color1 = texture(u_lut, texPos1).rgb;
+    vec3 color2 = texture(u_lut, texPos2).rgb;
+    vec3 finalColor = mix(color1, color2, fract(blueColor));
+    
+    outColor = vec4(finalColor, color.a);
   } else {
     outColor = color;
   }
@@ -57,34 +85,33 @@ function createProgram(gl: WebGL2RenderingContext, vertexShader: WebGLShader, fr
   gl.attachShader(program, vertexShader);
   gl.attachShader(program, fragmentShader);
   gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    console.error('Program link error:', gl.getProgramInfoLog(program));
-    gl.deleteProgram(program);
-    return null;
-  }
   return program;
 }
 
 interface LutFilterCanvasProps {
   src: string;
-  lutData: ParsedLUT | null;
+  lutUrl?: string | null;
   className?: string;
   style?: React.CSSProperties;
 }
 
-export function LutFilterCanvas({ src, lutData, className, style }: LutFilterCanvasProps) {
+export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // We must use WebGL2 for native 3D texture support (sampler3D)
     const gl = canvas.getContext('webgl2');
     if (!gl) {
-      console.error('WebGL2 is not supported by your browser.');
+      console.error('WebGL2 is not supported.');
       return;
     }
+
+    // Clear to transparent immediately so the canvas never sits in an
+    // indeterminate (often white) state while images are loading.
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
 
     let imageTexture: WebGLTexture | null = null;
     let lutTexture: WebGLTexture | null = null;
@@ -93,14 +120,28 @@ export function LutFilterCanvas({ src, lutData, className, style }: LutFilterCan
     let texCoordBuffer: WebGLBuffer | null = null;
     let vao: WebGLVertexArrayObject | null = null;
 
-    const image = new Image();
-    image.crossOrigin = 'anonymous';
-    
-    image.onload = () => {
-      // 1. Mobile Optimization: Handle device pixel ratio for sharp rendering
-      const dpr = window.devicePixelRatio || 1;
+    // Helper to load images as promises.
+    // crossOrigin = 'anonymous' is only needed for non-local URLs (LUT PNGs
+    // served from /public). Blob URLs (user-uploaded files) are same-origin
+    // and must NOT set crossOrigin, otherwise some browsers refuse to load them.
+    const loadImage = (url: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      const isLocalUrl = url.startsWith('blob:') || url.startsWith('data:');
+      if (!isLocalUrl) {
+        img.crossOrigin = 'anonymous';
+      }
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = url;
+    });
+
+    // Wait for both the user image and the LUT PNG to load
+    Promise.all([
+      loadImage(src),
+      lutUrl ? loadImage(lutUrl) : Promise.resolve(null)
+    ]).then(([image, lutImage]) => {
       
-      // Constrain max texture size to prevent memory crashes on mobile devices
+      const dpr = window.devicePixelRatio || 1;
       const maxWidth = 2048;
       let width = image.width;
       let height = image.height;
@@ -110,55 +151,38 @@ export function LutFilterCanvas({ src, lutData, className, style }: LutFilterCan
         width = maxWidth;
       }
       
-      // Set actual canvas resolution (internal buffer size)
       canvas.width = width * dpr;
       canvas.height = height * dpr;
-      
+      // Re-clear after resize: assigning canvas.width/height resets ALL WebGL
+      // state including the clear color, leaving the buffer indeterminate.
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
       gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
 
-      // 2. Compile Shaders
       const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
       const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
       if (!vertexShader || !fragmentShader) return;
 
       program = createProgram(gl, vertexShader, fragmentShader);
       if (!program) return;
-
       gl.useProgram(program);
 
-      // 3. Setup Geometry (Full-screen quad)
       const positionAttributeLocation = gl.getAttribLocation(program, 'a_position');
       const texCoordAttributeLocation = gl.getAttribLocation(program, 'a_texCoord');
 
       positionBuffer = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-      gl.bufferData(
-        gl.ARRAY_BUFFER,
-        new Float32Array([
-          -1.0, -1.0,
-           1.0, -1.0,
-          -1.0,  1.0,
-          -1.0,  1.0,
-           1.0, -1.0,
-           1.0,  1.0,
-        ]),
-        gl.STATIC_DRAW
-      );
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1.0, -1.0,  1.0, -1.0, -1.0,  1.0,
+        -1.0,  1.0,  1.0, -1.0,  1.0,  1.0,
+      ]), gl.STATIC_DRAW);
 
       texCoordBuffer = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
-      gl.bufferData(
-        gl.ARRAY_BUFFER,
-        new Float32Array([
-          0.0, 0.0,
-          1.0, 0.0,
-          0.0, 1.0,
-          0.0, 1.0,
-          1.0, 0.0,
-          1.0, 1.0,
-        ]),
-        gl.STATIC_DRAW
-      );
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        0.0, 0.0,  1.0, 0.0,  0.0, 1.0,
+        0.0, 1.0,  1.0, 0.0,  1.0, 1.0,
+      ]), gl.STATIC_DRAW);
 
       vao = gl.createVertexArray();
       gl.bindVertexArray(vao);
@@ -171,78 +195,48 @@ export function LutFilterCanvas({ src, lutData, className, style }: LutFilterCan
       gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
       gl.vertexAttribPointer(texCoordAttributeLocation, 2, gl.FLOAT, false, 0, 0);
 
-      // Ensure proper byte alignment for textures (crucial for RGB8 format)
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
-      // 4. Setup Image Texture
+      // Setup Base Image Texture
       imageTexture = gl.createTexture();
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, imageTexture);
-      
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-      
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
 
-      // 5. Setup LUT 3D Texture
+      // Setup LUT Texture (Now using TEXTURE_2D)
       lutTexture = gl.createTexture();
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_3D, lutTexture);
-      
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.bindTexture(gl.TEXTURE_2D, lutTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
       const hasLutLocation = gl.getUniformLocation(program, 'u_hasLut');
 
-      if (lutData) {
+      if (lutImage) {
         gl.uniform1i(hasLutLocation, 1);
-        gl.texImage3D(
-          gl.TEXTURE_3D,
-          0,
-          gl.RGB8, // Internal format
-          lutData.size,
-          lutData.size,
-          lutData.size,
-          0,
-          gl.RGB, // Format
-          gl.UNSIGNED_BYTE, // Type (Uint8Array ensures linear filtering works on all mobile devices)
-          lutData.data
-        );
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, lutImage);
       } else {
         gl.uniform1i(hasLutLocation, 0);
-        // Bind a dummy 1x1x1 texture to satisfy WebGL state requirements
-        gl.texImage3D(
-          gl.TEXTURE_3D,
-          0,
-          gl.RGB8,
-          1, 1, 1,
-          0,
-          gl.RGB,
-          gl.UNSIGNED_BYTE,
-          new Uint8Array([0, 0, 0])
-        );
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
       }
 
       const imageLocation = gl.getUniformLocation(program, 'u_image');
       const lutLocation = gl.getUniformLocation(program, 'u_lut');
 
-      gl.uniform1i(imageLocation, 0); // Bind to TEXTURE0
-      gl.uniform1i(lutLocation, 1);   // Bind to TEXTURE1
+      gl.uniform1i(imageLocation, 0);
+      gl.uniform1i(lutLocation, 1);
 
-      // 6. Draw
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
-    };
+    }).catch(console.error);
 
-    image.src = src;
-
-    // 7. Cleanup: Prevent memory leaks when navigating away
     return () => {
       if (gl) {
         if (imageTexture) gl.deleteTexture(imageTexture);
@@ -251,13 +245,11 @@ export function LutFilterCanvas({ src, lutData, className, style }: LutFilterCan
         if (texCoordBuffer) gl.deleteBuffer(texCoordBuffer);
         if (vao) gl.deleteVertexArray(vao);
         if (program) gl.deleteProgram(program);
-        
-        // Lose context to free up hardware resources immediately
         const ext = gl.getExtension('WEBGL_lose_context');
         if (ext) ext.loseContext();
       }
     };
-  }, [src, lutData]);
+  }, [src, lutUrl]);
 
   return <canvas ref={canvasRef} className={className} style={style} />;
 }
