@@ -13,6 +13,9 @@ export default function App() {
 
   const handleItemUpdate = (updatedItem: MediaItem) => {
     setItems((prev) => prev.map((item) => (item.id === updatedItem.id ? updatedItem : item)));
+    // Keep Studio in sync: without this the `item` prop is a stale snapshot
+    // from the moment the user clicked and edits applied mid-session are lost.
+    setEditingItem(updatedItem);
   };
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {

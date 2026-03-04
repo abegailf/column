@@ -7,6 +7,7 @@ export interface MediaEdits {
   temperature: number;
   tint: number;
   preset: string | null;
+  filterStrength: number; // 0–100 (default 100 = full preset strength)
 }
 
 export interface MediaItem {

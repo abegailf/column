@@ -5,6 +5,7 @@ import { getFilterStyle } from '../lib/filters';
 import { X, Undo2, Redo2, SlidersHorizontal, Image as ImageIcon, Download, Loader2, Sparkles, Plus } from 'lucide-react';
 import { cn } from '../lib/utils';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { LutFilterCanvas } from './LutFilterCanvas';
 
 interface StudioProps {
   item: MediaItem;
@@ -26,9 +27,16 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
   const [newRecipeName, setNewRecipeName] = useState('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const isMounted = useRef(false);
 
-  // Sync currentEdits to parent immediately
+  // Sync currentEdits to parent, but skip the initial mount so we don't
+  // fire onUpdate with the unchanged initial edits (which would cause App
+  // to call setEditingItem unnecessarily and trigger extra re-renders).
   useEffect(() => {
+    if (!isMounted.current) {
+      isMounted.current = true;
+      return;
+    }
     onUpdate({ ...item, edits: currentEdits });
   }, [currentEdits]);
 
@@ -324,6 +332,13 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
 
   const filterStyle = getFilterStyle(currentEdits);
 
+  // Resolve the LUT URL from the active preset's data definition so we never
+  // need to hard-code preset IDs here — any preset can opt into a LUT by
+  // setting `lutUrl` in data.ts.
+  const activeLutUrl = currentEdits.preset
+    ? (presets.find(p => p.id === currentEdits.preset)?.lutUrl ?? null)
+    : null;
+
   return (
     <div className="fixed inset-0 z-50 bg-black flex flex-col text-white">
       {/* Header */}
@@ -361,13 +376,26 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
       <div className="flex-1 flex items-center justify-center overflow-hidden pt-16 pb-48">
         <div className="w-full h-full max-w-2xl mx-auto flex items-center justify-center p-4">
           {item.type === 'image' ? (
-            <img
-              src={item.url}
-              alt="Preview"
-              className="max-w-full max-h-full object-contain"
-              style={filterStyle}
-              referrerPolicy="no-referrer"
-            />
+            activeLutUrl ? (
+              // LUT preset active — render through WebGL so the colour grade
+              // is baked into the canvas pixels.
+              <LutFilterCanvas
+                src={item.url}
+                lutUrl={activeLutUrl}
+                strength={currentEdits.filterStrength ?? 100}
+                className="max-w-full max-h-full object-contain"
+                style={filterStyle}
+              />
+            ) : (
+              // No LUT — a plain <img> is sufficient and avoids creating an
+              // unnecessary WebGL context for the common (non-LUT) case.
+              <img
+                src={item.url}
+                alt=""
+                className="max-w-full max-h-full object-contain"
+                style={filterStyle}
+              />
+            )
           ) : (
             <video
               ref={videoRef}
@@ -401,14 +429,25 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                   )}
                 >
                   <div className="w-16 h-16 rounded-md overflow-hidden bg-neutral-900 border border-white/20 relative">
-                    {/* Static thumbnail for preset preview to avoid video performance issues */}
-                    <img
-                      src={item.type === 'image' ? item.url : 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?q=80&w=200&auto=format&fit=crop'}
-                      alt={preset.name}
-                      className="w-full h-full object-cover"
-                      style={getFilterStyle({ ...defaultEdits, preset: preset.id === 'none' ? null : preset.id })}
-                      referrerPolicy="no-referrer"
-                    />
+                    {preset.lutUrl ? (
+                      // LUT-based preset: render via WebGL canvas so the
+                      // thumbnail actually shows the colour grade.
+                      <LutFilterCanvas
+                        src={item.type === 'image' ? item.url : 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?q=80&w=200&auto=format&fit=crop'}
+                        lutUrl={preset.lutUrl}
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      // CSS-filter preset: a plain <img> with the filter applied
+                      // is sufficient and avoids creating unnecessary WebGL contexts.
+                      <img
+                        src={item.type === 'image' ? item.url : 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?q=80&w=200&auto=format&fit=crop'}
+                        alt={preset.name}
+                        className="w-full h-full object-cover"
+                        style={getFilterStyle({ ...defaultEdits, preset: preset.id === 'none' ? null : preset.id })}
+                        referrerPolicy="no-referrer"
+                      />
+                    )}
                   </div>
                   <span className="text-xs font-medium tracking-wider uppercase">{preset.name}</span>
                 </button>
@@ -506,6 +545,20 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
             </div>
           )}
         </div>
+
+        {/* Filter Strength — visible whenever a non-Original preset is active */}
+        {currentEdits.preset && (
+          <div className="px-6 py-2 border-t border-white/10">
+            <SliderControl
+              label="Strength"
+              value={currentEdits.filterStrength ?? 100}
+              min={0}
+              max={100}
+              onChange={(val) => handleSliderChange('filterStrength', val)}
+              onRelease={(val) => handleSliderRelease('filterStrength', val)}
+            />
+          </div>
+        )}
 
         {/* Tab Navigation */}
         <div className="flex items-center justify-center gap-8 p-4 border-t border-white/10">
