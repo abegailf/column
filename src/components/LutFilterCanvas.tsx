@@ -107,7 +107,7 @@ function createProgram(gl: WebGL2RenderingContext, vertexShader: WebGLShader, fr
  * in our candidate list where `size × ceil(√size) === W`.
  */
 function detectLutParams(width: number, height: number): { size: number; cols: number } {
-  const candidates = [64, 32, 16, 8];
+  const candidates = [64, 32, 25, 16, 8];
   for (const size of candidates) {
     const cols = Math.ceil(Math.sqrt(size));
     if (size * cols === width && size * cols === height) {
