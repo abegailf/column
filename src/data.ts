@@ -56,8 +56,8 @@ export const sampleMedia: MediaItem[] = [
 export const presets: Preset[] = [
   { id: 'none', name: 'Original', cssFilter: 'none' },
   // ADD YOUR NEW PRESET HERE:
-  { id: 'moody_film', name: 'Moody Film', lutUrl: '/moody_film.png', cssFilter: 'none' },
-  { id: 'fave_brown', name: 'Fave Brown', lutUrl: '/Favebrown.png', cssFilter: 'none' },
+  { id: 'moody_film', name: 'Moody Film', lutUrl: '/moody_film.cube', cssFilter: 'none' },
+  { id: 'fave_brown', name: 'Fave Brown', lutUrl: '/Favebrown.cube', cssFilter: 'none' },
   { id: 'a4', name: 'A4', cssFilter: 'sepia(0.2) contrast(1.1) saturate(0.9) hue-rotate(-5deg)' },
   { id: 'a6', name: 'A6', cssFilter: 'sepia(0.1) contrast(1.2) saturate(0.8) brightness(1.05)' },
   { id: 'c1', name: 'C1', cssFilter: 'saturate(1.3) contrast(1.1) brightness(1.1) hue-rotate(5deg)' },

@@ -1,5 +1,40 @@
-import React, { useEffect, useRef } from 'react';
+/**
+ * LutFilterCanvas.tsx
+ *
+ * WebGL2 canvas component that applies a 3D LUT colour grade to an image.
+ *
+ * Architecture
+ * ────────────────────────────────────────────────────────────────────────────
+ *  • The LUT is loaded directly from a .cube file (fetched as plain text,
+ *    parsed by parseCubeLut.ts) and uploaded to a WebGL2 TEXTURE_3D.
+ *    No intermediate PNG conversion is needed.
+ *
+ *  • The fragment shader samples the 3D texture with a single
+ *    `texture(u_lut, lutCoord)` call — the GPU handles trilinear
+ *    interpolation natively, which is more accurate and simpler than the
+ *    manual two-bilinear-sample approach required for a 2D tiled PNG.
+ *
+ *  • Texel-centre remapping:
+ *      UV = input * (size-1)/size + 0.5/size
+ *    ensures that input 0.0 lands on the centre of the first texel and
+ *    input 1.0 lands on the centre of the last texel, so GL_LINEAR
+ *    never clamps the interpolation at the boundaries.
+ *
+ *  • Strength slider uses a lightweight renderRef so only the u_strength
+ *    uniform is updated and redrawn — no image reload, no flash.
+ *
+ *  • The source image is fetched via fetch() → blob URL to avoid the
+ *    CORS browser-cache conflict that arises when the same URL is first
+ *    loaded by a plain <img> (no crossOrigin) and then re-requested with
+ *    crossOrigin="anonymous" for WebGL.
+ */
 
+import React, { useEffect, useRef } from 'react';
+import { fetchParseCubeLut } from '../lib/parseCubeLut';
+
+// ── Vertex shader ─────────────────────────────────────────────────────────────
+// Draws a full-screen quad.  Y is flipped because WebGL textures are uploaded
+// with row 0 at the bottom while DOM images have row 0 at the top.
 const vertexShaderSource = `#version 300 es
 in vec2 a_position;
 in vec2 a_texCoord;
@@ -7,25 +42,24 @@ out vec2 v_texCoord;
 
 void main() {
   gl_Position = vec4(a_position, 0.0, 1.0);
-  // Flip Y coordinate because WebGL textures are uploaded upside-down relative to the DOM
-  v_texCoord = vec2(a_texCoord.x, 1.0 - a_texCoord.y);
+  v_texCoord  = vec2(a_texCoord.x, 1.0 - a_texCoord.y);
 }
 `;
 
+// ── Fragment shader ───────────────────────────────────────────────────────────
+// Uses a sampler3D so the GPU performs native trilinear interpolation.
+// No tile arithmetic needed — the whole LUT cube lives in a 3D texture.
 const fragmentShaderSource = `#version 300 es
 precision highp float;
+precision highp sampler3D;
+
 in vec2 v_texCoord;
 
-uniform sampler2D u_image;
-uniform sampler2D u_lut;
-uniform bool u_hasLut;
-// LUT geometry — set at runtime from the actual image dimensions so that
-// LUT PNGs of different sizes (e.g. 192×192 / size=32 / cols=6, or
-// 512×512 / size=64 / cols=8) all work without shader changes.
-uniform float u_lutSize;
-uniform float u_lutCols;
-// Blend factor: 0.0 = original, 1.0 = full LUT grade
-uniform float u_strength;
+uniform sampler2D u_image;   // source photograph
+uniform sampler3D u_lut;     // 3D colour look-up table
+uniform bool      u_hasLut;  // false → pass-through
+uniform float     u_lutSize; // texels per axis (e.g. 32 or 25)
+uniform float     u_strength;// 0.0 = original  1.0 = full grade
 
 out vec4 outColor;
 
@@ -33,39 +67,17 @@ void main() {
   vec4 color = texture(u_image, v_texCoord);
 
   if (u_hasLut) {
-    float size = u_lutSize;
-    float cols = u_lutCols;
-
     vec3 c = clamp(color.rgb, 0.0, 1.0);
-    float blueColor = c.b * (size - 1.0);
 
-    // Find the two Z-depth quads to interpolate between
-    vec2 quad1;
-    quad1.y = floor(floor(blueColor) / cols);
-    quad1.x = floor(blueColor) - (quad1.y * cols);
+    // Remap [0, 1] input to texel-centre UV coordinates so that:
+    //   c = 0.0  →  UV = 0.5 / size          (centre of first texel)
+    //   c = 1.0  →  UV = (size - 0.5) / size  (centre of last texel)
+    // GL_LINEAR then trilinearly interpolates between adjacent texels.
+    float scale  = (u_lutSize - 1.0) / u_lutSize;
+    float offset = 0.5 / u_lutSize;
+    vec3 lutCoord = c * scale + offset;
 
-    vec2 quad2;
-    quad2.y = floor(ceil(blueColor) / cols);
-    quad2.x = ceil(blueColor) - (quad2.y * cols);
-
-    float texWidth  = size * cols;
-    float texHeight = size * cols;
-
-    // Map Red/Green to X/Y inside the specific Z-depth quad
-    vec2 texPos1;
-    texPos1.x = (quad1.x * size + 0.5 + c.r * (size - 1.0)) / texWidth;
-    texPos1.y = (quad1.y * size + 0.5 + c.g * (size - 1.0)) / texHeight;
-
-    vec2 texPos2;
-    texPos2.x = (quad2.x * size + 0.5 + c.r * (size - 1.0)) / texWidth;
-    texPos2.y = (quad2.y * size + 0.5 + c.g * (size - 1.0)) / texHeight;
-
-    // Sample both 2D positions and mix (trilinear interpolation via two bilinear samples)
-    vec3 color1 = texture(u_lut, texPos1).rgb;
-    vec3 color2 = texture(u_lut, texPos2).rgb;
-    vec3 lut_rgb = mix(color1, color2, fract(blueColor));
-
-    // Blend original with LUT output based on strength
+    vec3 lut_rgb = texture(u_lut, lutCoord).rgb;
     outColor = vec4(mix(color.rgb, lut_rgb, u_strength), color.a);
   } else {
     outColor = color;
@@ -73,7 +85,12 @@ void main() {
 }
 `;
 
-function createShader(gl: WebGL2RenderingContext, type: number, source: string) {
+// ── GL helpers ────────────────────────────────────────────────────────────────
+function createShader(
+  gl: WebGL2RenderingContext,
+  type: number,
+  source: string
+): WebGLShader | null {
   const shader = gl.createShader(type);
   if (!shader) return null;
   gl.shaderSource(shader, source);
@@ -86,44 +103,28 @@ function createShader(gl: WebGL2RenderingContext, type: number, source: string) 
   return shader;
 }
 
-function createProgram(gl: WebGL2RenderingContext, vertexShader: WebGLShader, fragmentShader: WebGLShader) {
+function createProgram(
+  gl: WebGL2RenderingContext,
+  vs: WebGLShader,
+  fs: WebGLShader
+): WebGLProgram | null {
   const program = gl.createProgram();
   if (!program) return null;
-  gl.attachShader(program, vertexShader);
-  gl.attachShader(program, fragmentShader);
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
   gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    console.error('Program link error:', gl.getProgramInfoLog(program));
+    gl.deleteProgram(program);
+    return null;
+  }
   return program;
 }
 
-/**
- * Auto-detect LUT geometry from the image dimensions.
- *
- * Common square-grid formats:
- *   192×192  →  size=32, cols=6   (32 × ceil(√32)=6 = 192)
- *   512×512  →  size=64, cols=8   (64 × ceil(√64)=8 = 512)
- *    64×64   →  size=8,  cols=8   ( 8 × ceil(√8 )=3 = 24 — non-square strip)
- *
- * The rule: given a square LUT image of side W, find the largest `size`
- * in our candidate list where `size × ceil(√size) === W`.
- */
-function detectLutParams(width: number, height: number): { size: number; cols: number } {
-  const candidates = [64, 32, 25, 16, 8];
-  for (const size of candidates) {
-    const cols = Math.ceil(Math.sqrt(size));
-    if (size * cols === width && size * cols === height) {
-      return { size, cols };
-    }
-  }
-  // Fallback: derive cols from whatever image dimensions we got
-  // (handles non-square-grid or unusual sizes gracefully).
-  const size = Math.round(Math.cbrt(width * height));
-  const cols = width / size;
-  console.warn(`LutFilterCanvas: unrecognised LUT dimensions ${width}×${height}, guessing size=${size} cols=${cols}`);
-  return { size, cols };
-}
-
+// ── Component ─────────────────────────────────────────────────────────────────
 interface LutFilterCanvasProps {
   src: string;
+  /** URL to a .cube LUT file served from public/ */
   lutUrl?: string | null;
   className?: string;
   style?: React.CSSProperties;
@@ -131,69 +132,65 @@ interface LutFilterCanvasProps {
   strength?: number;
 }
 
-export function LutFilterCanvas({ src, lutUrl, className, style, strength = 100 }: LutFilterCanvasProps) {
+export function LutFilterCanvas({
+  src,
+  lutUrl,
+  className,
+  style,
+  strength = 100,
+}: LutFilterCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Keep a ref that always holds the latest strength so the async .then()
-  // callback can read it without needing to be in the dependency array.
+  // Always holds the latest strength so the async .then() callback and the
+  // strength effect both read the current value without needing it in deps.
   const strengthRef = useRef(strength);
   strengthRef.current = strength;
 
-  // renderRef stores a lightweight redraw function once GL is set up.
-  // Calling it with a new strength value updates the uniform and redraws
-  // without reloading images — giving smooth slider interaction.
+  // Lightweight redraw function stored once GL resources are ready.
+  // Calling it only updates u_strength and redraws — no image reload.
   const renderRef = useRef<((s: number) => void) | null>(null);
 
-  // Main effect: (re)runs only when the source image or LUT changes.
-  // Handles image loading, GL resource creation, and the initial draw.
+  // ── Main effect — runs when source image or LUT changes ──────────────────
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Flag to cancel the async image load when the effect is cleaned up
-    // (React StrictMode double-invokes effects, and prop changes trigger
-    // cleanup + re-run on the same canvas element).
     let cancelled = false;
 
     const gl = canvas.getContext('webgl2');
     if (!gl) {
-      console.error('WebGL2 is not supported.');
+      console.error('LutFilterCanvas: WebGL2 is not supported in this browser.');
       return;
     }
 
-    // Clear immediately so the canvas never shows a stale/white frame
-    // while the new image is loading.
+    // Show a transparent frame immediately while assets load
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
-    let imageTexture: WebGLTexture | null = null;
-    let lutTexture: WebGLTexture | null = null;
-    let program: WebGLProgram | null = null;
+    // GL resources — tracked so cleanup can free them precisely
+    let imageTexture:  WebGLTexture | null = null;
+    let lutTexture:    WebGLTexture | null = null;
+    let program:       WebGLProgram | null = null;
     let positionBuffer: WebGLBuffer | null = null;
     let texCoordBuffer: WebGLBuffer | null = null;
-    let vao: WebGLVertexArrayObject | null = null;
+    let vao:           WebGLVertexArrayObject | null = null;
 
-    // Track blob URLs we create so we can revoke them on cleanup.
+    // Blob URLs created for the source image — revoked on cleanup
     const blobUrls: string[] = [];
 
-    // Load an image via fetch → blob URL so WebGL can use it as a texture
-    // without CORS restrictions.  Using fetch() avoids the browser-cache
-    // CORS conflict that occurs when the same URL is first loaded by a plain
-    // <img> (no crossOrigin attribute) and then re-requested with
-    // crossOrigin="anonymous" for WebGL — in that case the browser may serve
-    // the cached opaque response, which WebGL rejects as a security violation.
+    // Load the source image via fetch → blob URL so WebGL can use it as a
+    // texture without triggering the CORS browser-cache conflict that occurs
+    // when the same Unsplash URL is first cached without crossOrigin by a
+    // plain <img> and then re-requested with crossOrigin="anonymous".
     const loadImage = async (url: string): Promise<HTMLImageElement> => {
       let imgSrc = url;
-
       if (!url.startsWith('blob:') && !url.startsWith('data:')) {
-        // Fetch as blob to get a same-origin URL that WebGL trusts.
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`Failed to fetch image (${response.status}): ${url}`);
-        const blob = await response.blob();
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`Image fetch failed (${res.status}): ${url}`);
+        const blob = await res.blob();
         imgSrc = URL.createObjectURL(blob);
         blobUrls.push(imgSrc);
       }
-
       return new Promise<HTMLImageElement>((resolve, reject) => {
         const img = new Image();
         img.onload = () => resolve(img);
@@ -202,71 +199,71 @@ export function LutFilterCanvas({ src, lutUrl, className, style, strength = 100 
       });
     };
 
-    // Wait for both the user image and the LUT PNG to load
+    // Fetch both assets in parallel
     Promise.all([
       loadImage(src),
-      lutUrl ? loadImage(lutUrl) : Promise.resolve(null)
-    ]).then(([image, lutImage]) => {
-      // Bail out if the effect was cleaned up while we were loading.
+      lutUrl ? fetchParseCubeLut(lutUrl) : Promise.resolve(null),
+    ]).then(([image, lut]) => {
       if (cancelled) return;
 
+      // ── Canvas / viewport setup ─────────────────────────────────────────
       const dpr = window.devicePixelRatio || 1;
       const maxWidth = 2048;
-      let width = image.width;
-      let height = image.height;
+      let w = image.naturalWidth;
+      let h = image.naturalHeight;
+      if (w > maxWidth) { h = Math.floor(h * maxWidth / w); w = maxWidth; }
 
-      if (width > maxWidth) {
-        height = Math.floor(height * (maxWidth / width));
-        width = maxWidth;
-      }
-
-      canvas.width = width * dpr;
-      canvas.height = height * dpr;
-      // Re-clear after resize: assigning canvas.width/height resets ALL WebGL
-      // state including the clear color, leaving the buffer indeterminate.
+      canvas.width  = w * dpr;
+      canvas.height = h * dpr;
+      // Assigning canvas dimensions resets all WebGL state — re-clear
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
-      gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+      gl.viewport(0, 0, canvas.width, canvas.height);
 
-      const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
-      const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
-      if (!vertexShader || !fragmentShader) return;
+      // ── Shader program ─────────────────────────────────────────────────
+      const vs = createShader(gl, gl.VERTEX_SHADER,   vertexShaderSource);
+      const fs = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
+      if (!vs || !fs) return;
 
-      program = createProgram(gl, vertexShader, fragmentShader);
+      program = createProgram(gl, vs, fs);
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
       if (!program) return;
       gl.useProgram(program);
 
-      const positionAttributeLocation = gl.getAttribLocation(program, 'a_position');
-      const texCoordAttributeLocation = gl.getAttribLocation(program, 'a_texCoord');
+      // ── Full-screen quad geometry ──────────────────────────────────────
+      const posLoc = gl.getAttribLocation(program, 'a_position');
+      const texLoc = gl.getAttribLocation(program, 'a_texCoord');
 
       positionBuffer = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-        -1.0, -1.0,  1.0, -1.0, -1.0,  1.0,
-        -1.0,  1.0,  1.0, -1.0,  1.0,  1.0,
+        -1, -1,  1, -1, -1,  1,
+        -1,  1,  1, -1,  1,  1,
       ]), gl.STATIC_DRAW);
 
       texCoordBuffer = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-        0.0, 0.0,  1.0, 0.0,  0.0, 1.0,
-        0.0, 1.0,  1.0, 0.0,  1.0, 1.0,
+        0, 0,  1, 0,  0, 1,
+        0, 1,  1, 0,  1, 1,
       ]), gl.STATIC_DRAW);
 
       vao = gl.createVertexArray();
       gl.bindVertexArray(vao);
 
-      gl.enableVertexAttribArray(positionAttributeLocation);
+      gl.enableVertexAttribArray(posLoc);
       gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-      gl.vertexAttribPointer(positionAttributeLocation, 2, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
 
-      gl.enableVertexAttribArray(texCoordAttributeLocation);
+      gl.enableVertexAttribArray(texLoc);
       gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
-      gl.vertexAttribPointer(texCoordAttributeLocation, 2, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribPointer(texLoc, 2, gl.FLOAT, false, 0, 0);
 
+      // Tight packing for all typed-array texture uploads below
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
 
-      // Setup Base Image Texture
+      // ── Source image → TEXTURE_2D on unit 0 ────────────────────────────
       imageTexture = gl.createTexture();
       gl.activeTexture(gl.TEXTURE0);
       gl.bindTexture(gl.TEXTURE_2D, imageTexture);
@@ -276,90 +273,111 @@ export function LutFilterCanvas({ src, lutUrl, className, style, strength = 100 
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
 
-      // Setup LUT Texture (Now using TEXTURE_2D)
+      // ── LUT → TEXTURE_3D on unit 1 ─────────────────────────────────────
+      // WebGL2 TEXTURE_3D maps directly onto the .cube axis layout:
+      //   X (width)  = R input axis    (R varies fastest in .cube)
+      //   Y (height) = G input axis
+      //   Z (depth)  = B input axis    (B varies slowest in .cube)
+      // So we can upload the Float32 data as-is after converting to Uint8.
+      //
+      // RGBA8 (4 bytes/pixel) is used because:
+      //   • Always row-aligned regardless of LUT size (no UNPACK_ALIGNMENT issue)
+      //   • Filterable with GL_LINEAR in WebGL2 core without any extension
+      //   • Sufficient precision (~0.2% max error) for a consumer filter app
       lutTexture = gl.createTexture();
       gl.activeTexture(gl.TEXTURE1);
-      gl.bindTexture(gl.TEXTURE_2D, lutTexture);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.bindTexture(gl.TEXTURE_3D, lutTexture);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_3D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-      const hasLutLocation  = gl.getUniformLocation(program, 'u_hasLut');
-      const lutSizeLocation = gl.getUniformLocation(program, 'u_lutSize');
-      const lutColsLocation = gl.getUniformLocation(program, 'u_lutCols');
-      const strengthLocation = gl.getUniformLocation(program, 'u_strength');
+      const hasLutLoc   = gl.getUniformLocation(program, 'u_hasLut');
+      const lutSizeLoc  = gl.getUniformLocation(program, 'u_lutSize');
+      const strengthLoc = gl.getUniformLocation(program, 'u_strength');
+      const imageLoc    = gl.getUniformLocation(program, 'u_image');
+      const lutLoc      = gl.getUniformLocation(program, 'u_lut');
 
-      if (lutImage) {
-        // Derive size / cols from the actual LUT image so any future LUT
-        // PNG (different resolution) works without touching the shader.
-        const { size, cols } = detectLutParams(lutImage.naturalWidth, lutImage.naturalHeight);
-        gl.uniform1i(hasLutLocation, 1);
-        gl.uniform1f(lutSizeLocation, size);
-        gl.uniform1f(lutColsLocation, cols);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, lutImage);
+      gl.uniform1i(imageLoc, 0); // TEXTURE0
+      gl.uniform1i(lutLoc,   1); // TEXTURE1
+
+      if (lut) {
+        const { size, data } = lut;
+
+        // Convert Float32 RGB → RGBA8 Uint8
+        const pixels = new Uint8Array(size * size * size * 4);
+        for (let i = 0; i < size * size * size; i++) {
+          pixels[i * 4]     = Math.round(Math.max(0, Math.min(255, data[i * 3]     * 255)));
+          pixels[i * 4 + 1] = Math.round(Math.max(0, Math.min(255, data[i * 3 + 1] * 255)));
+          pixels[i * 4 + 2] = Math.round(Math.max(0, Math.min(255, data[i * 3 + 2] * 255)));
+          pixels[i * 4 + 3] = 255;
+        }
+
+        gl.texImage3D(
+          gl.TEXTURE_3D, 0, gl.RGBA8,
+          size, size, size,
+          0, gl.RGBA, gl.UNSIGNED_BYTE,
+          pixels
+        );
+        gl.uniform1i(hasLutLoc,  1);
+        gl.uniform1f(lutSizeLoc, size);
       } else {
-        gl.uniform1i(hasLutLocation, 0);
-        gl.uniform1f(lutSizeLocation, 32.0); // dummy values — u_hasLut=false means they're unused
-        gl.uniform1f(lutColsLocation, 6.0);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
+        // No LUT — upload a 1×1×1 placeholder so the sampler3D binding
+        // remains valid (avoids a "no texture" warning in some drivers)
+        gl.texImage3D(
+          gl.TEXTURE_3D, 0, gl.RGBA8,
+          1, 1, 1,
+          0, gl.RGBA, gl.UNSIGNED_BYTE,
+          new Uint8Array([0, 0, 0, 255])
+        );
+        gl.uniform1i(hasLutLoc,  0);
+        gl.uniform1f(lutSizeLoc, 1.0);
       }
 
-      const imageLocation = gl.getUniformLocation(program, 'u_image');
-      const lutLocation   = gl.getUniformLocation(program, 'u_lut');
-
-      gl.uniform1i(imageLocation, 0);
-      gl.uniform1i(lutLocation, 1);
-
-      // Build a lightweight redraw function that only touches the strength
-      // uniform — no texture re-uploads, no buffer rebinds.  Calling this
-      // from the strength effect gives smooth slider interaction.
+      // ── Render function ────────────────────────────────────────────────
+      // Lightweight redraw: only updates u_strength and calls drawArrays.
+      // All other state (program, VAO, textures) is already bound.
       const render = (s: number) => {
         if (!program) return;
         gl.useProgram(program);
         gl.bindVertexArray(vao);
-        gl.uniform1f(strengthLocation, s / 100);
+        gl.uniform1f(strengthLoc, s / 100);
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
         gl.drawArrays(gl.TRIANGLES, 0, 6);
       };
 
-      // Initial draw using whatever strength is current at load time.
+      // Initial draw — use current strength at load time
       render(strengthRef.current);
 
-      // Expose the render function for subsequent strength-only updates.
+      // Expose for the strength effect below
       renderRef.current = render;
-    }).catch(err => {
+    }).catch((err: unknown) => {
       if (!cancelled) console.error('LutFilterCanvas render error:', err);
     });
 
+    // ── Cleanup ───────────────────────────────────────────────────────────
     return () => {
       cancelled = true;
-      // Tear down the fast-redraw path immediately so a stale render
-      // function is never called after this effect is cleaned up.
       renderRef.current = null;
-      // Revoke any blob URLs we created to free memory.
-      blobUrls.forEach(u => URL.revokeObjectURL(u));
+      blobUrls.forEach((u) => URL.revokeObjectURL(u));
       if (gl) {
-        if (imageTexture) gl.deleteTexture(imageTexture);
-        if (lutTexture) gl.deleteTexture(lutTexture);
+        if (imageTexture)  gl.deleteTexture(imageTexture);
+        if (lutTexture)    gl.deleteTexture(lutTexture);
         if (positionBuffer) gl.deleteBuffer(positionBuffer);
         if (texCoordBuffer) gl.deleteBuffer(texCoordBuffer);
-        if (vao) gl.deleteVertexArray(vao);
-        if (program) gl.deleteProgram(program);
-        // DO NOT call loseContext() here.  Destroying the WebGL context in
-        // cleanup causes blank/white rendering when the effect re-runs on the
-        // same canvas element — React StrictMode double-invokes effects by
-        // design, and changing `src`/`lutUrl` also triggers cleanup + re-run
-        // on the very same <canvas> node.  Deleting the individual GL objects
-        // above is sufficient to free GPU resources without nuking the context.
+        if (vao)           gl.deleteVertexArray(vao);
+        if (program)       gl.deleteProgram(program);
+        // DO NOT call loseContext() — it destroys the context on the DOM node
+        // and breaks re-renders when React StrictMode re-runs the effect.
       }
     };
   }, [src, lutUrl]);
 
-  // Strength effect: when only `strength` changes, skip the expensive image
-  // reload and call the stored render function directly.  This keeps the
-  // slider interaction smooth (no blank flash, no network round-trip).
+  // ── Strength effect ───────────────────────────────────────────────────────
+  // When only `strength` changes, skip the expensive image/LUT reload and
+  // just call the stored render function. No flash, no network round-trip.
   useEffect(() => {
     renderRef.current?.(strength);
   }, [strength]);
