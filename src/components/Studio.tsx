@@ -376,12 +376,25 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
       <div className="flex-1 flex items-center justify-center overflow-hidden pt-16 pb-48">
         <div className="w-full h-full max-w-2xl mx-auto flex items-center justify-center p-4">
           {item.type === 'image' ? (
-            <LutFilterCanvas
-              src={item.url}
-              lutUrl={activeLutUrl}
-              className="max-w-full max-h-full object-contain"
-              style={filterStyle}
-            />
+            activeLutUrl ? (
+              // LUT preset active — render through WebGL so the colour grade
+              // is baked into the canvas pixels.
+              <LutFilterCanvas
+                src={item.url}
+                lutUrl={activeLutUrl}
+                className="max-w-full max-h-full object-contain"
+                style={filterStyle}
+              />
+            ) : (
+              // No LUT — a plain <img> is sufficient and avoids creating an
+              // unnecessary WebGL context for the common (non-LUT) case.
+              <img
+                src={item.url}
+                alt=""
+                className="max-w-full max-h-full object-contain"
+                style={filterStyle}
+              />
+            )
           ) : (
             <video
               ref={videoRef}

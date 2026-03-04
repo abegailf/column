@@ -17,49 +17,51 @@ precision highp float;
 in vec2 v_texCoord;
 
 uniform sampler2D u_image;
-uniform sampler2D u_lut; // Switched to 2D
+uniform sampler2D u_lut;
 uniform bool u_hasLut;
+// LUT geometry — set at runtime from the actual image dimensions so that
+// LUT PNGs of different sizes (e.g. 192×192 / size=32 / cols=6, or
+// 512×512 / size=64 / cols=8) all work without shader changes.
+uniform float u_lutSize;
+uniform float u_lutCols;
 
 out vec4 outColor;
 
 void main() {
   vec4 color = texture(u_image, v_texCoord);
-  
+
   if (u_hasLut) {
-    // Math configuration for our 64-size LUT converted to an 8x8 grid on a 512x512 texture
-    float size = 64.0;
-    float cols = 8.0;
-    
+    float size = u_lutSize;
+    float cols = u_lutCols;
+
     vec3 c = clamp(color.rgb, 0.0, 1.0);
     float blueColor = c.b * (size - 1.0);
-    
+
     // Find the two Z-depth quads to interpolate between
     vec2 quad1;
     quad1.y = floor(floor(blueColor) / cols);
     quad1.x = floor(blueColor) - (quad1.y * cols);
-    
+
     vec2 quad2;
     quad2.y = floor(ceil(blueColor) / cols);
     quad2.x = ceil(blueColor) - (quad2.y * cols);
-    
-    float texWidth = size * cols;
+
+    float texWidth  = size * cols;
     float texHeight = size * cols;
-    
+
     // Map Red/Green to X/Y inside the specific Z-depth quad
     vec2 texPos1;
     texPos1.x = (quad1.x * size + 0.5 + c.r * (size - 1.0)) / texWidth;
     texPos1.y = (quad1.y * size + 0.5 + c.g * (size - 1.0)) / texHeight;
-    
+
     vec2 texPos2;
     texPos2.x = (quad2.x * size + 0.5 + c.r * (size - 1.0)) / texWidth;
     texPos2.y = (quad2.y * size + 0.5 + c.g * (size - 1.0)) / texHeight;
-    
-    // Sample both 2D points and mix (Simulated Trilinear Interpolation)
+
+    // Sample both 2D positions and mix (trilinear interpolation via two bilinear samples)
     vec3 color1 = texture(u_lut, texPos1).rgb;
     vec3 color2 = texture(u_lut, texPos2).rgb;
-    vec3 finalColor = mix(color1, color2, fract(blueColor));
-    
-    outColor = vec4(finalColor, color.a);
+    outColor = vec4(mix(color1, color2, fract(blueColor)), color.a);
   } else {
     outColor = color;
   }
@@ -88,6 +90,33 @@ function createProgram(gl: WebGL2RenderingContext, vertexShader: WebGLShader, fr
   return program;
 }
 
+/**
+ * Auto-detect LUT geometry from the image dimensions.
+ *
+ * Common square-grid formats:
+ *   192×192  →  size=32, cols=6   (32 × ceil(√32)=6 = 192)
+ *   512×512  →  size=64, cols=8   (64 × ceil(√64)=8 = 512)
+ *    64×64   →  size=8,  cols=8   ( 8 × ceil(√8 )=3 = 24 — non-square strip)
+ *
+ * The rule: given a square LUT image of side W, find the largest `size`
+ * in our candidate list where `size × ceil(√size) === W`.
+ */
+function detectLutParams(width: number, height: number): { size: number; cols: number } {
+  const candidates = [64, 32, 16, 8];
+  for (const size of candidates) {
+    const cols = Math.ceil(Math.sqrt(size));
+    if (size * cols === width && size * cols === height) {
+      return { size, cols };
+    }
+  }
+  // Fallback: derive cols from whatever image dimensions we got
+  // (handles non-square-grid or unusual sizes gracefully).
+  const size = Math.round(Math.cbrt(width * height));
+  const cols = width / size;
+  console.warn(`LutFilterCanvas: unrecognised LUT dimensions ${width}×${height}, guessing size=${size} cols=${cols}`);
+  return { size, cols };
+}
+
 interface LutFilterCanvasProps {
   src: string;
   lutUrl?: string | null;
@@ -102,14 +131,19 @@ export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanv
     const canvas = canvasRef.current;
     if (!canvas) return;
 
+    // Flag to cancel the async image load when the effect is cleaned up
+    // (React StrictMode double-invokes effects, and prop changes trigger
+    // cleanup + re-run on the same canvas element).
+    let cancelled = false;
+
     const gl = canvas.getContext('webgl2');
     if (!gl) {
       console.error('WebGL2 is not supported.');
       return;
     }
 
-    // Clear to transparent immediately so the canvas never sits in an
-    // indeterminate (often white) state while images are loading.
+    // Clear immediately so the canvas never shows a stale/white frame
+    // while the new image is loading.
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
 
@@ -120,37 +154,53 @@ export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanv
     let texCoordBuffer: WebGLBuffer | null = null;
     let vao: WebGLVertexArrayObject | null = null;
 
-    // Helper to load images as promises.
-    // crossOrigin = 'anonymous' is only needed for non-local URLs (LUT PNGs
-    // served from /public). Blob URLs (user-uploaded files) are same-origin
-    // and must NOT set crossOrigin, otherwise some browsers refuse to load them.
-    const loadImage = (url: string) => new Promise<HTMLImageElement>((resolve, reject) => {
-      const img = new Image();
-      const isLocalUrl = url.startsWith('blob:') || url.startsWith('data:');
-      if (!isLocalUrl) {
-        img.crossOrigin = 'anonymous';
+    // Track blob URLs we create so we can revoke them on cleanup.
+    const blobUrls: string[] = [];
+
+    // Load an image via fetch → blob URL so WebGL can use it as a texture
+    // without CORS restrictions.  Using fetch() avoids the browser-cache
+    // CORS conflict that occurs when the same URL is first loaded by a plain
+    // <img> (no crossOrigin attribute) and then re-requested with
+    // crossOrigin="anonymous" for WebGL — in that case the browser may serve
+    // the cached opaque response, which WebGL rejects as a security violation.
+    const loadImage = async (url: string): Promise<HTMLImageElement> => {
+      let imgSrc = url;
+
+      if (!url.startsWith('blob:') && !url.startsWith('data:')) {
+        // Fetch as blob to get a same-origin URL that WebGL trusts.
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Failed to fetch image (${response.status}): ${url}`);
+        const blob = await response.blob();
+        imgSrc = URL.createObjectURL(blob);
+        blobUrls.push(imgSrc);
       }
-      img.onload = () => resolve(img);
-      img.onerror = reject;
-      img.src = url;
-    });
+
+      return new Promise<HTMLImageElement>((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = imgSrc;
+      });
+    };
 
     // Wait for both the user image and the LUT PNG to load
     Promise.all([
       loadImage(src),
       lutUrl ? loadImage(lutUrl) : Promise.resolve(null)
     ]).then(([image, lutImage]) => {
-      
+      // Bail out if the effect was cleaned up while we were loading.
+      if (cancelled) return;
+
       const dpr = window.devicePixelRatio || 1;
       const maxWidth = 2048;
       let width = image.width;
       let height = image.height;
-      
+
       if (width > maxWidth) {
         height = Math.floor(height * (maxWidth / width));
         width = maxWidth;
       }
-      
+
       canvas.width = width * dpr;
       canvas.height = height * dpr;
       // Re-clear after resize: assigning canvas.width/height resets ALL WebGL
@@ -216,18 +266,27 @@ export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanv
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
-      const hasLutLocation = gl.getUniformLocation(program, 'u_hasLut');
+      const hasLutLocation  = gl.getUniformLocation(program, 'u_hasLut');
+      const lutSizeLocation = gl.getUniformLocation(program, 'u_lutSize');
+      const lutColsLocation = gl.getUniformLocation(program, 'u_lutCols');
 
       if (lutImage) {
+        // Derive size / cols from the actual LUT image so any future LUT
+        // PNG (different resolution) works without touching the shader.
+        const { size, cols } = detectLutParams(lutImage.naturalWidth, lutImage.naturalHeight);
         gl.uniform1i(hasLutLocation, 1);
+        gl.uniform1f(lutSizeLocation, size);
+        gl.uniform1f(lutColsLocation, cols);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, lutImage);
       } else {
         gl.uniform1i(hasLutLocation, 0);
+        gl.uniform1f(lutSizeLocation, 32.0); // dummy values — u_hasLut=false means they're unused
+        gl.uniform1f(lutColsLocation, 6.0);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 0]));
       }
 
       const imageLocation = gl.getUniformLocation(program, 'u_image');
-      const lutLocation = gl.getUniformLocation(program, 'u_lut');
+      const lutLocation   = gl.getUniformLocation(program, 'u_lut');
 
       gl.uniform1i(imageLocation, 0);
       gl.uniform1i(lutLocation, 1);
@@ -235,9 +294,14 @@ export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanv
       gl.clearColor(0, 0, 0, 0);
       gl.clear(gl.COLOR_BUFFER_BIT);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
-    }).catch(console.error);
+    }).catch(err => {
+      if (!cancelled) console.error('LutFilterCanvas render error:', err);
+    });
 
     return () => {
+      cancelled = true;
+      // Revoke any blob URLs we created to free memory.
+      blobUrls.forEach(u => URL.revokeObjectURL(u));
       if (gl) {
         if (imageTexture) gl.deleteTexture(imageTexture);
         if (lutTexture) gl.deleteTexture(lutTexture);
@@ -245,8 +309,12 @@ export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanv
         if (texCoordBuffer) gl.deleteBuffer(texCoordBuffer);
         if (vao) gl.deleteVertexArray(vao);
         if (program) gl.deleteProgram(program);
-        const ext = gl.getExtension('WEBGL_lose_context');
-        if (ext) ext.loseContext();
+        // DO NOT call loseContext() here.  Destroying the WebGL context in
+        // cleanup causes blank/white rendering when the effect re-runs on the
+        // same canvas element — React StrictMode double-invokes effects by
+        // design, and changing `src`/`lutUrl` also triggers cleanup + re-run
+        // on the very same <canvas> node.  Deleting the individual GL objects
+        // above is sufficient to free GPU resources without nuking the context.
       }
     };
   }, [src, lutUrl]);
