@@ -7,6 +7,7 @@ export const defaultEdits = {
   temperature: 0,
   tint: 0,
   preset: null,
+  filterStrength: 100,
 };
 
 export const sampleMedia: MediaItem[] = [

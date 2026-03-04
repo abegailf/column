@@ -24,6 +24,8 @@ uniform bool u_hasLut;
 // 512×512 / size=64 / cols=8) all work without shader changes.
 uniform float u_lutSize;
 uniform float u_lutCols;
+// Blend factor: 0.0 = original, 1.0 = full LUT grade
+uniform float u_strength;
 
 out vec4 outColor;
 
@@ -61,7 +63,10 @@ void main() {
     // Sample both 2D positions and mix (trilinear interpolation via two bilinear samples)
     vec3 color1 = texture(u_lut, texPos1).rgb;
     vec3 color2 = texture(u_lut, texPos2).rgb;
-    outColor = vec4(mix(color1, color2, fract(blueColor)), color.a);
+    vec3 lut_rgb = mix(color1, color2, fract(blueColor));
+
+    // Blend original with LUT output based on strength
+    outColor = vec4(mix(color.rgb, lut_rgb, u_strength), color.a);
   } else {
     outColor = color;
   }
@@ -122,11 +127,25 @@ interface LutFilterCanvasProps {
   lutUrl?: string | null;
   className?: string;
   style?: React.CSSProperties;
+  /** Filter strength 0–100 (default 100 = full LUT applied) */
+  strength?: number;
 }
 
-export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanvasProps) {
+export function LutFilterCanvas({ src, lutUrl, className, style, strength = 100 }: LutFilterCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Keep a ref that always holds the latest strength so the async .then()
+  // callback can read it without needing to be in the dependency array.
+  const strengthRef = useRef(strength);
+  strengthRef.current = strength;
+
+  // renderRef stores a lightweight redraw function once GL is set up.
+  // Calling it with a new strength value updates the uniform and redraws
+  // without reloading images — giving smooth slider interaction.
+  const renderRef = useRef<((s: number) => void) | null>(null);
+
+  // Main effect: (re)runs only when the source image or LUT changes.
+  // Handles image loading, GL resource creation, and the initial draw.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -269,6 +288,7 @@ export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanv
       const hasLutLocation  = gl.getUniformLocation(program, 'u_hasLut');
       const lutSizeLocation = gl.getUniformLocation(program, 'u_lutSize');
       const lutColsLocation = gl.getUniformLocation(program, 'u_lutCols');
+      const strengthLocation = gl.getUniformLocation(program, 'u_strength');
 
       if (lutImage) {
         // Derive size / cols from the actual LUT image so any future LUT
@@ -291,15 +311,33 @@ export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanv
       gl.uniform1i(imageLocation, 0);
       gl.uniform1i(lutLocation, 1);
 
-      gl.clearColor(0, 0, 0, 0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
+      // Build a lightweight redraw function that only touches the strength
+      // uniform — no texture re-uploads, no buffer rebinds.  Calling this
+      // from the strength effect gives smooth slider interaction.
+      const render = (s: number) => {
+        if (!program) return;
+        gl.useProgram(program);
+        gl.bindVertexArray(vao);
+        gl.uniform1f(strengthLocation, s / 100);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      };
+
+      // Initial draw using whatever strength is current at load time.
+      render(strengthRef.current);
+
+      // Expose the render function for subsequent strength-only updates.
+      renderRef.current = render;
     }).catch(err => {
       if (!cancelled) console.error('LutFilterCanvas render error:', err);
     });
 
     return () => {
       cancelled = true;
+      // Tear down the fast-redraw path immediately so a stale render
+      // function is never called after this effect is cleaned up.
+      renderRef.current = null;
       // Revoke any blob URLs we created to free memory.
       blobUrls.forEach(u => URL.revokeObjectURL(u));
       if (gl) {
@@ -318,6 +356,13 @@ export function LutFilterCanvas({ src, lutUrl, className, style }: LutFilterCanv
       }
     };
   }, [src, lutUrl]);
+
+  // Strength effect: when only `strength` changes, skip the expensive image
+  // reload and call the stored render function directly.  This keeps the
+  // slider interaction smooth (no blank flash, no network round-trip).
+  useEffect(() => {
+    renderRef.current?.(strength);
+  }, [strength]);
 
   return <canvas ref={canvasRef} className={className} style={style} />;
 }

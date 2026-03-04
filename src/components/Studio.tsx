@@ -382,6 +382,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
               <LutFilterCanvas
                 src={item.url}
                 lutUrl={activeLutUrl}
+                strength={currentEdits.filterStrength ?? 100}
                 className="max-w-full max-h-full object-contain"
                 style={filterStyle}
               />
@@ -544,6 +545,20 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
             </div>
           )}
         </div>
+
+        {/* Filter Strength — visible whenever a non-Original preset is active */}
+        {currentEdits.preset && (
+          <div className="px-6 py-2 border-t border-white/10">
+            <SliderControl
+              label="Strength"
+              value={currentEdits.filterStrength ?? 100}
+              min={0}
+              max={100}
+              onChange={(val) => handleSliderChange('filterStrength', val)}
+              onRelease={(val) => handleSliderRelease('filterStrength', val)}
+            />
+          </div>
+        )}
 
         {/* Tab Navigation */}
         <div className="flex items-center justify-center gap-8 p-4 border-t border-white/10">
