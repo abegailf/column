@@ -5,6 +5,8 @@ import { MediaItem } from '../types';
 import { cn } from '../lib/utils';
 import { Play, Layers } from 'lucide-react';
 import { getFilterStyle } from '../lib/filters';
+import { presets } from '../data';
+import { LutFilterCanvas } from './LutFilterCanvas';
 
 interface SortableMediaItemProps {
   key?: string | number;
@@ -48,6 +50,13 @@ export function SortableMediaItem({ item, onClick }: SortableMediaItemProps) {
 
   const filterStyle = getFilterStyle(item.edits);
 
+  // Resolve the active LUT preset (if any) so the thumbnail renders through WebGL
+  const activeLutPreset = item.edits.preset
+    ? presets.find((p) => p.id === item.edits.preset && p.lutUrl)
+    : undefined;
+  const lutUrl   = activeLutPreset?.lutUrl ?? null;
+  const strength = item.edits.filterStrength ?? 100;
+
   return (
     <div
       ref={setNodeRef}
@@ -63,12 +72,35 @@ export function SortableMediaItem({ item, onClick }: SortableMediaItemProps) {
       {...listeners}
     >
       {item.type === 'image' ? (
-        <img
+        lutUrl ? (
+          // LUT preset active — render through WebGL so the grid thumbnail
+          // actually shows the colour grade.
+          <LutFilterCanvas
+            src={item.url}
+            lutUrl={lutUrl}
+            strength={strength}
+            className="w-full h-full object-cover pointer-events-none"
+            style={filterStyle}
+          />
+        ) : (
+          <img
+            src={item.url}
+            alt=""
+            className="w-full h-full object-cover pointer-events-none"
+            style={filterStyle}
+            referrerPolicy="no-referrer"
+          />
+        )
+      ) : lutUrl ? (
+        // Video with LUT — WebGL canvas with rAF loop; `playing` mirrors hover state
+        <LutFilterCanvas
           src={item.url}
-          alt=""
+          srcType="video"
+          lutUrl={lutUrl}
+          strength={strength}
+          playing={isHovered}
           className="w-full h-full object-cover pointer-events-none"
           style={filterStyle}
-          referrerPolicy="no-referrer"
         />
       ) : (
         <video

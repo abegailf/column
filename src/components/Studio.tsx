@@ -6,6 +6,7 @@ import { X, Undo2, Redo2, SlidersHorizontal, Image as ImageIcon, Download, Loade
 import { cn } from '../lib/utils';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import { LutFilterCanvas } from './LutFilterCanvas';
+import { LutExporter } from '../lib/lutExport';
 
 interface StudioProps {
   item: MediaItem;
@@ -38,7 +39,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
       return;
     }
     onUpdate({ ...item, edits: currentEdits });
-  }, [currentEdits]);
+  }, [currentEdits]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const pushHistory = (newEdits: MediaEdits) => {
     const newHistory = history.slice(0, historyIndex + 1);
@@ -95,9 +96,19 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
     setIsExporting(true);
 
     try {
+      // CSS filter string for manual adjustments (brightness/contrast/etc.)
+      // For LUT presets cssFilter is 'none', so filterString only carries
+      // manual slider values — perfect for compositing on top of the LUT output.
       const filterString = getFilterStyle(currentEdits).filter as string;
 
+      // Resolve active LUT preset URL (null if CSS-only or no preset)
+      const activeLutUrl = currentEdits.preset
+        ? (presets.find(p => p.id === currentEdits.preset)?.lutUrl ?? null)
+        : null;
+      const lutStrength = currentEdits.filterStrength ?? 100;
+
       if (item.type === 'image') {
+        // ── Image export ────────────────────────────────────────────────────
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
         if (!ctx) throw new Error('Could not get canvas context');
@@ -109,11 +120,30 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
           img.onerror = reject;
           img.src = item.url;
         });
-        
-        canvas.width = img.naturalWidth;
+
+        canvas.width  = img.naturalWidth;
         canvas.height = img.naturalHeight;
-        ctx.filter = filterString;
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+        if (activeLutUrl) {
+          // LUT is active — render through WebGL first, then blit to 2D canvas
+          const exporter = await LutExporter.create(activeLutUrl, lutStrength);
+          if (exporter) {
+            exporter.render(img, img.naturalWidth, img.naturalHeight, lutStrength);
+            // Apply manual adjustments on top via CSS filter
+            ctx.filter = filterString !== 'none' ? filterString : 'none';
+            ctx.drawImage(exporter.canvas, 0, 0, canvas.width, canvas.height);
+            ctx.filter = 'none';
+            exporter.destroy();
+          } else {
+            // WebGL2 not available — fall back to CSS-only
+            ctx.filter = filterString;
+            ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          }
+        } else {
+          // CSS preset or no preset
+          ctx.filter = filterString;
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        }
 
         const dataUrl = canvas.toDataURL('image/jpeg', 1.0);
         const a = document.createElement('a');
@@ -122,8 +152,9 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
         document.body.appendChild(a);
         a.click();
         document.body.removeChild(a);
+
       } else {
-        // Video export
+        // ── Video export ────────────────────────────────────────────────────
         await new Promise<void>((resolve, reject) => {
           const video = document.createElement('video');
           video.crossOrigin = 'anonymous';
@@ -134,16 +165,34 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
           video.onloadedmetadata = async () => {
             try {
               const canvas = document.createElement('canvas');
-              // Ensure even dimensions for H.264 encoding
-              canvas.width = Math.round(video.videoWidth / 2) * 2;
+              canvas.width  = Math.round(video.videoWidth  / 2) * 2;
               canvas.height = Math.round(video.videoHeight / 2) * 2;
               const ctx = canvas.getContext('2d');
               if (!ctx) return reject(new Error('Could not get canvas context'));
 
-              ctx.filter = filterString;
+              // Create LUT exporter once so the shader + 3D texture are
+              // compiled/uploaded only once and reused for every frame.
+              let lutExporter: LutExporter | null = null;
+              if (activeLutUrl) {
+                lutExporter = await LutExporter.create(activeLutUrl, lutStrength);
+              }
 
-              // Use WebCodecs and mp4-muxer for exact frame timing and guaranteed MP4
+              // Helper: draw one video frame to the 2D encoding canvas,
+              // applying LUT (via WebGL) and manual adjustments (via CSS filter).
+              const drawFrame = () => {
+                if (lutExporter) {
+                  lutExporter.render(video, canvas.width, canvas.height, lutStrength);
+                  ctx.filter = filterString !== 'none' ? filterString : 'none';
+                  ctx.drawImage(lutExporter.canvas, 0, 0, canvas.width, canvas.height);
+                  ctx.filter = 'none';
+                } else {
+                  ctx.filter = filterString;
+                  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                }
+              };
+
               if (typeof VideoEncoder !== 'undefined') {
+                // ── WebCodecs path ─────────────────────────────────────────
                 let audioBuffer: AudioBuffer | null = null;
                 try {
                   const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -159,14 +208,9 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
 
                 const muxerOptions: any = {
                   target: new ArrayBufferTarget(),
-                  video: {
-                    codec: 'avc',
-                    width: canvas.width,
-                    height: canvas.height,
-                  },
+                  video: { codec: 'avc', width: canvas.width, height: canvas.height },
                   fastStart: 'in-memory',
                 };
-
                 if (audioBuffer) {
                   muxerOptions.audio = {
                     codec: 'aac',
@@ -181,9 +225,8 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                   output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
                   error: (e) => reject(e),
                 });
-
                 videoEncoder.configure({
-                  codec: 'avc1.4d002a', // Main Profile, Level 4.2
+                  codec: 'avc1.4d002a',
                   width: canvas.width,
                   height: canvas.height,
                   bitrate: 5_000_000,
@@ -192,7 +235,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
 
                 let audioEncodePromise = Promise.resolve();
                 if (audioBuffer) {
-                  // @ts-ignore - AudioEncoder might not be in all TS DOM libs
+                  // @ts-ignore
                   const audioEncoder = new AudioEncoder({
                     output: (chunk: any, meta: any) => muxer.addAudioChunk(chunk, meta),
                     error: (e: any) => console.error('Audio encoding error:', e),
@@ -203,17 +246,15 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                     numberOfChannels: audioBuffer.numberOfChannels,
                     bitrate: 128000,
                   });
-
                   audioEncodePromise = (async () => {
                     const numberOfFrames = audioBuffer!.length;
-                    const chunkSize = 44100; // 1 second chunks
+                    const chunkSize = 44100;
                     for (let start = 0; start < numberOfFrames; start += chunkSize) {
-                      const end = Math.min(start + chunkSize, numberOfFrames);
+                      const end       = Math.min(start + chunkSize, numberOfFrames);
                       const frameCount = end - start;
                       const data = new Float32Array(frameCount * audioBuffer!.numberOfChannels);
                       for (let c = 0; c < audioBuffer!.numberOfChannels; c++) {
-                        const channelData = audioBuffer!.getChannelData(c);
-                        data.set(channelData.subarray(start, end), c * frameCount);
+                        data.set(audioBuffer!.getChannelData(c).subarray(start, end), c * frameCount);
                       }
                       // @ts-ignore
                       const audioData = new AudioData({
@@ -222,7 +263,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                         numberOfChannels: audioBuffer!.numberOfChannels,
                         numberOfFrames: frameCount,
                         timestamp: (start / audioBuffer!.sampleRate) * 1e6,
-                        data: data,
+                        data,
                       });
                       audioEncoder.encode(audioData);
                       audioData.close();
@@ -232,13 +273,12 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                 }
 
                 const fps = 30;
-                const duration = video.duration;
-                const totalFrames = Math.floor(duration * fps);
+                const totalFrames = Math.floor(video.duration * fps);
                 let currentFrame = 0;
 
                 video.onseeked = async () => {
                   try {
-                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    drawFrame();
                     const frame = new VideoFrame(canvas, { timestamp: (currentFrame / fps) * 1e6 });
                     videoEncoder.encode(frame, { keyFrame: currentFrame % 30 === 0 });
                     frame.close();
@@ -250,6 +290,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                       await videoEncoder.flush();
                       await audioEncodePromise;
                       muxer.finalize();
+                      lutExporter?.destroy();
                       const buffer = (muxer.target as ArrayBufferTarget).buffer;
                       const blob = new Blob([buffer], { type: 'video/mp4' });
                       const url = URL.createObjectURL(blob);
@@ -263,37 +304,31 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                       resolve();
                     }
                   } catch (e) {
+                    lutExporter?.destroy();
                     reject(e);
                   }
                 };
 
-                // Start the frame-by-frame processing
                 video.currentTime = 0;
-              } else {
-                // Fallback for older browsers without WebCodecs
-                let mimeType = 'video/mp4';
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                  mimeType = 'video/webm;codecs=vp9';
-                }
-                if (!MediaRecorder.isTypeSupported(mimeType)) {
-                  mimeType = 'video/webm';
-                }
 
-                const stream = canvas.captureStream(30);
+              } else {
+                // ── MediaRecorder fallback ─────────────────────────────────
+                let mimeType = 'video/mp4';
+                if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm;codecs=vp9';
+                if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = 'video/webm';
+
+                const stream   = canvas.captureStream(30);
                 const recorder = new MediaRecorder(stream, { mimeType });
                 const chunks: BlobPart[] = [];
 
-                recorder.ondataavailable = (e) => {
-                  if (e.data.size > 0) chunks.push(e.data);
-                };
-
+                recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
                 recorder.onstop = () => {
+                  lutExporter?.destroy();
                   const blob = new Blob(chunks, { type: mimeType });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
+                  const url  = URL.createObjectURL(blob);
+                  const a    = document.createElement('a');
                   a.href = url;
-                  const ext = mimeType.includes('mp4') ? 'mp4' : 'webm';
-                  a.download = `column-export-${Date.now()}.${ext}`;
+                  a.download = `column-export-${Date.now()}.${mimeType.includes('mp4') ? 'mp4' : 'webm'}`;
                   document.body.appendChild(a);
                   a.click();
                   document.body.removeChild(a);
@@ -304,13 +339,12 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                 recorder.start();
                 video.play().catch(reject);
 
-                const drawFrame = () => {
+                const rafDraw = () => {
                   if (video.paused || video.ended) return;
-                  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                  requestAnimationFrame(drawFrame);
+                  drawFrame();
+                  requestAnimationFrame(rafDraw);
                 };
-
-                video.onplay = () => drawFrame();
+                video.onplay  = () => rafDraw();
                 video.onended = () => recorder.stop();
                 video.onerror = reject;
               }
@@ -318,7 +352,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
               reject(e);
             }
           };
-          
+
           video.onerror = reject;
         });
       }
@@ -332,9 +366,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
 
   const filterStyle = getFilterStyle(currentEdits);
 
-  // Resolve the LUT URL from the active preset's data definition so we never
-  // need to hard-code preset IDs here — any preset can opt into a LUT by
-  // setting `lutUrl` in data.ts.
+  // Resolve the LUT URL from the active preset's data definition
   const activeLutUrl = currentEdits.preset
     ? (presets.find(p => p.id === currentEdits.preset)?.lutUrl ?? null)
     : null;
@@ -365,7 +397,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
             onClick={handleExport}
             disabled={isExporting}
             className="p-2 hover:bg-white/10 rounded-full transition-colors ml-2"
-            title="Export Photo"
+            title="Export"
           >
             {isExporting ? <Loader2 className="w-5 h-5 animate-spin" /> : <Download className="w-5 h-5" />}
           </button>
@@ -377,18 +409,14 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
         <div className="w-full h-full max-w-2xl mx-auto flex items-center justify-center p-4">
           {item.type === 'image' ? (
             activeLutUrl ? (
-              // LUT preset active — render through WebGL so the colour grade
-              // is baked into the canvas pixels.
               <LutFilterCanvas
                 src={item.url}
                 lutUrl={activeLutUrl}
                 strength={currentEdits.filterStrength ?? 100}
                 className="max-w-full max-h-full object-contain"
-                style={filterStyle}
+                style={{ height: 'auto', ...filterStyle }}
               />
             ) : (
-              // No LUT — a plain <img> is sufficient and avoids creating an
-              // unnecessary WebGL context for the common (non-LUT) case.
               <img
                 src={item.url}
                 alt=""
@@ -396,6 +424,17 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                 style={filterStyle}
               />
             )
+          ) : activeLutUrl ? (
+            // Video with LUT — render every frame through WebGL
+            <LutFilterCanvas
+              src={item.url}
+              srcType="video"
+              lutUrl={activeLutUrl}
+              strength={currentEdits.filterStrength ?? 100}
+              playing={true}
+              className="max-w-full max-h-full object-contain"
+              style={{ height: 'auto', ...filterStyle }}
+            />
           ) : (
             <video
               ref={videoRef}
@@ -430,16 +469,12 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
                 >
                   <div className="w-16 h-16 rounded-md overflow-hidden bg-neutral-900 border border-white/20 relative">
                     {preset.lutUrl ? (
-                      // LUT-based preset: render via WebGL canvas so the
-                      // thumbnail actually shows the colour grade.
                       <LutFilterCanvas
                         src={item.type === 'image' ? item.url : 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?q=80&w=200&auto=format&fit=crop'}
                         lutUrl={preset.lutUrl}
                         className="w-full h-full object-cover"
                       />
                     ) : (
-                      // CSS-filter preset: a plain <img> with the filter applied
-                      // is sufficient and avoids creating unnecessary WebGL contexts.
                       <img
                         src={item.type === 'image' ? item.url : 'https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?q=80&w=200&auto=format&fit=crop'}
                         alt={preset.name}
@@ -505,40 +540,35 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
               <SliderControl
                 label="Brightness"
                 value={currentEdits.brightness}
-                min={0}
-                max={200}
+                min={0} max={200}
                 onChange={(val) => handleSliderChange('brightness', val)}
                 onRelease={(val) => handleSliderRelease('brightness', val)}
               />
               <SliderControl
                 label="Contrast"
                 value={currentEdits.contrast}
-                min={0}
-                max={200}
+                min={0} max={200}
                 onChange={(val) => handleSliderChange('contrast', val)}
                 onRelease={(val) => handleSliderRelease('contrast', val)}
               />
               <SliderControl
                 label="Saturation"
                 value={currentEdits.saturation}
-                min={0}
-                max={200}
+                min={0} max={200}
                 onChange={(val) => handleSliderChange('saturation', val)}
                 onRelease={(val) => handleSliderRelease('saturation', val)}
               />
               <SliderControl
                 label="Temperature"
                 value={currentEdits.temperature}
-                min={-100}
-                max={100}
+                min={-100} max={100}
                 onChange={(val) => handleSliderChange('temperature', val)}
                 onRelease={(val) => handleSliderRelease('temperature', val)}
               />
               <SliderControl
                 label="Tint"
                 value={currentEdits.tint}
-                min={-100}
-                max={100}
+                min={-100} max={100}
                 onChange={(val) => handleSliderChange('tint', val)}
                 onRelease={(val) => handleSliderRelease('tint', val)}
               />
@@ -552,8 +582,7 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
             <SliderControl
               label="Strength"
               value={currentEdits.filterStrength ?? 100}
-              min={0}
-              max={100}
+              min={0} max={100}
               onChange={(val) => handleSliderChange('filterStrength', val)}
               onRelease={(val) => handleSliderRelease('filterStrength', val)}
             />
@@ -564,30 +593,24 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
         <div className="flex items-center justify-center gap-8 p-4 border-t border-white/10">
           <button
             onClick={() => setActiveTab('presets')}
-            className={cn(
-              'flex flex-col items-center gap-1 transition-opacity',
-              activeTab === 'presets' ? 'opacity-100' : 'opacity-50 hover:opacity-80'
-            )}
+            className={cn('flex flex-col items-center gap-1 transition-opacity',
+              activeTab === 'presets' ? 'opacity-100' : 'opacity-50 hover:opacity-80')}
           >
             <ImageIcon className="w-5 h-5" />
             <span className="text-[10px] uppercase tracking-widest">Presets</span>
           </button>
           <button
             onClick={() => setActiveTab('recipes')}
-            className={cn(
-              'flex flex-col items-center gap-1 transition-opacity',
-              activeTab === 'recipes' ? 'opacity-100' : 'opacity-50 hover:opacity-80'
-            )}
+            className={cn('flex flex-col items-center gap-1 transition-opacity',
+              activeTab === 'recipes' ? 'opacity-100' : 'opacity-50 hover:opacity-80')}
           >
             <Sparkles className="w-5 h-5" />
             <span className="text-[10px] uppercase tracking-widest">Recipes</span>
           </button>
           <button
             onClick={() => setActiveTab('adjust')}
-            className={cn(
-              'flex flex-col items-center gap-1 transition-opacity',
-              activeTab === 'adjust' ? 'opacity-100' : 'opacity-50 hover:opacity-80'
-            )}
+            className={cn('flex flex-col items-center gap-1 transition-opacity',
+              activeTab === 'adjust' ? 'opacity-100' : 'opacity-50 hover:opacity-80')}
           >
             <SlidersHorizontal className="w-5 h-5" />
             <span className="text-[10px] uppercase tracking-widest">Adjust</span>
