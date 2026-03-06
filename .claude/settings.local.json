@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install)",
+      "Bash(node --version)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(git commit:*)",
+      "Bash(git push -u origin feat/lut-canvas-preview)",
+      "Bash(gh pr:*)",
+      "Bash(where gh)",
+      "Bash(node node_modules/vite/bin/vite.js --port=3000 --host=0.0.0.0)",
+      "Bash(curl -s http://localhost:3000)",
+      "Bash(git add src/components/Studio.tsx src/data.ts)",
+      "Bash(git push origin feat/lut-canvas-preview)",
+      "Bash(curl -s http://localhost:3002)",
+      "Bash(git add src/components/LutFilterCanvas.tsx src/components/Studio.tsx)",
+      "Bash(npx tsc --noEmit)",
+      "Bash(npx tsc --noEmit --project \"C:\\\\Users\\\\My Computer\\\\Documents\\\\column v2\\\\tsconfig.json\")",
+      "Bash(node \"C:\\\\Users\\\\My Computer\\\\Documents\\\\column v2\\\\node_modules\\\\typescript\\\\bin\\\\tsc\" --noEmit --project \"C:\\\\Users\\\\My Computer\\\\Documents\\\\column v2\\\\tsconfig.json\")",
+      "Bash(git add src/types.ts src/data.ts src/lib/filters.ts src/components/LutFilterCanvas.tsx src/components/Studio.tsx)",
+      "Bash(node -e \":*)",
+      "Bash(git add src/components/LutFilterCanvas.tsx src/data.ts)",
+      "Bash(node -e \"require\\(''pngjs''\\); console.log\\(''pngjs OK''\\);\")",
+      "Bash(node convert-lut.cjs)",
+      "Bash(node \"C:/Users/My Computer/Documents/column v2/node_modules/.bin/tsx\" --version)",
+      "Bash(git add convert-lut.cjs public/moody_film.png public/Favebrown.png Favebrown.cube)"
+    ]
+  }
+}

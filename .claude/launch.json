@@ -1,0 +1,16 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "column-app",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "C:\\Users\\My Computer\\Documents\\column v2\\node_modules\\vite\\bin\\vite.js",
+        "C:\\Users\\My Computer\\Documents\\column v2",
+        "--port=3000",
+        "--host=0.0.0.0"
+      ],
+      "port": 3000
+    }
+  ]
+}

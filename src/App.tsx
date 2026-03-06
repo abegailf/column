@@ -13,6 +13,10 @@ export default function App() {
 
   const handleItemUpdate = (updatedItem: MediaItem) => {
     setItems((prev) => prev.map((item) => (item.id === updatedItem.id ? updatedItem : item)));
+    // Keep the Studio in sync: without this, the `item` prop in Studio is a
+    // stale snapshot from the moment the user clicked, and edits applied by
+    // Studio's own useEffect would be lost if the parent re-renders.
+    setEditingItem(updatedItem);
   };
 
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {

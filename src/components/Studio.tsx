@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { MediaItem, MediaEdits, Recipe } from '../types';
 import { presets, defaultEdits } from '../data';
 import { getFilterStyle } from '../lib/filters';
@@ -26,9 +26,17 @@ export function Studio({ item, onClose, onUpdate, recipes, setRecipes }: StudioP
   const [newRecipeName, setNewRecipeName] = useState('');
 
   const videoRef = useRef<HTMLVideoElement>(null);
+  const isMounted = useRef(false);
 
-  // Sync currentEdits to parent immediately
+  // Sync currentEdits to parent, but only after the first render.
+  // Without the guard the effect fires on mount with the unchanged initial
+  // edits, which causes App to call setEditingItem unnecessarily and can
+  // trigger extra re-renders or subtle state staleness issues.
   useEffect(() => {
+    if (!isMounted.current) {
+      isMounted.current = true;
+      return;
+    }
     onUpdate({ ...item, edits: currentEdits });
   }, [currentEdits]);
 

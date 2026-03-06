@@ -86,6 +86,11 @@ export function LutFilterCanvas({ src, lutData, className, style }: LutFilterCan
       return;
     }
 
+    // Clear immediately so the canvas is transparent/black while the image
+    // loads, instead of showing whatever the GPU left in memory (often white).
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+
     let imageTexture: WebGLTexture | null = null;
     let lutTexture: WebGLTexture | null = null;
     let program: WebGLProgram | null = null;
@@ -94,8 +99,46 @@ export function LutFilterCanvas({ src, lutData, className, style }: LutFilterCan
     let vao: WebGLVertexArrayObject | null = null;
 
     const image = new Image();
-    image.crossOrigin = 'anonymous';
-    
+
+    // Only set crossOrigin for non-blob/non-data URLs.
+    // Blob URLs (user-uploaded files) are same-origin and don't need CORS.
+    // External URLs (e.g. Unsplash) may not send Access-Control-Allow-Origin,
+    // which would cause onload to silently fail and leave a white canvas.
+    const isLocalUrl = src.startsWith('blob:') || src.startsWith('data:');
+    if (!isLocalUrl) {
+      image.crossOrigin = 'anonymous';
+    }
+
+    image.onerror = () => {
+      // If crossOrigin mode caused the load to fail (common with CDN images
+      // that don't serve CORS headers), retry without it so we can at least
+      // display the image (canvas will be CPU-tainted but still visible).
+      if (!isLocalUrl && image.crossOrigin) {
+        const fallback = new Image();
+        fallback.onload = () => {
+          // Canvas will be tainted — WebGL texture upload will fail for
+          // cross-origin images without CORS headers. Clear to transparent
+          // so the CSS background shows instead of a stale white frame.
+          if (gl) {
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+          }
+        };
+        fallback.onerror = () => {
+          if (gl) {
+            gl.clearColor(0, 0, 0, 0);
+            gl.clear(gl.COLOR_BUFFER_BIT);
+          }
+        };
+        fallback.src = src;
+      } else {
+        if (gl) {
+          gl.clearColor(0, 0, 0, 0);
+          gl.clear(gl.COLOR_BUFFER_BIT);
+        }
+      }
+    };
+
     image.onload = () => {
       // 1. Mobile Optimization: Handle device pixel ratio for sharp rendering
       const dpr = window.devicePixelRatio || 1;
